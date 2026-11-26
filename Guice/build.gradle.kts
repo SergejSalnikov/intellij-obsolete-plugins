@@ -29,6 +29,8 @@ dependencies {
   intellijPlatform {
     intellijIdea("2026.1")
     bundledPlugin("com.intellij.java")
+    // The tests have Kotlin sources. The production code reaches Kotlin through UAST only.
+    testBundledPlugin("org.jetbrains.kotlin")
     testFramework(TestFrameworkType.Platform)
     testFramework(TestFrameworkType.Plugin.Java)
   }
