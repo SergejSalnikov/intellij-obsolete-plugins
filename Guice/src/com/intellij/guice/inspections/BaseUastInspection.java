@@ -7,6 +7,9 @@ import com.intellij.codeInspection.ProblemsHolder;
 import com.intellij.codeInspection.util.InspectionMessage;
 import com.intellij.guice.model.extensions.GuiceCallMatcher;
 import com.intellij.guice.model.extensions.GuiceCallPattern;
+import com.intellij.guice.model.GuiceProjectModel;
+import com.intellij.openapi.module.Module;
+import com.intellij.openapi.module.ModuleUtilCore;
 import com.intellij.psi.PsiElementVisitor;
 import com.intellij.uast.UastHintedVisitorAdapter;
 import org.jetbrains.annotations.NotNull;
@@ -90,6 +93,11 @@ public abstract class BaseUastInspection extends LocalInspectionTool {
 
   @Override
   public @NotNull PsiElementVisitor buildVisitor(final @NotNull ProblemsHolder holder, final boolean isOnTheFly) {
+    // A module without Guice has nothing to inspect. The line marker providers use the same check.
+    Module module = ModuleUtilCore.findModuleForFile(holder.getFile());
+    if (module == null || !GuiceProjectModel.isGuiceAvailable(module)) {
+      return PsiElementVisitor.EMPTY_VISITOR;
+    }
     return UastHintedVisitorAdapter.create(
       holder.getFile().getLanguage(),
       buildUastVisitor(holder),

@@ -49,8 +49,8 @@ public final class GuiceEntry {
   /**
    * Identifies the gutter anchor of an entry by position, for O(1) lookups in {@link GuiceNavigationIndex}.
    *
-   * <p>A position key is valid only while the index holds a fresh extraction of the file. The line marker
-   * providers guarantee this for the highlighted file ({@link GuiceProjectModel#ensureFileCurrent}), and the
+   * <p>A position key is valid only for a fresh extraction of the file. When the index is behind on the
+   * highlighted file, a line marker pass takes the entries of that file from a {@link GuiceFileOverlay}. The
    * index re-keys a file's entries on every update, also when the entries did not change.
    * A {@link SmartPsiElementPointer} would survive edits, but its hash code is only the file and the element
    * kind, so a map keyed by pointers degrades to range comparisons over all anchors of a file.
@@ -247,6 +247,16 @@ public final class GuiceEntry {
    */
   public boolean isValid() {
     return myNavigationTarget.getElement() != null;
+  }
+
+  /**
+   * Whether the file of the navigation target still exists. Unlike {@link #isValid()}, it does not restore the
+   * element, so a line marker pass can test many entries without the PSI of their files. The element can be
+   * gone while the file exists, but only between an edit of that file and its background update.
+   */
+  boolean isInValidFile() {
+    VirtualFile file = myNavigationTarget.getVirtualFile();
+    return file != null ? file.isValid() : myNavigationTarget.getElement() != null;
   }
 
   @Override

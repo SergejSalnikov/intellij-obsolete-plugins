@@ -4,11 +4,16 @@ package com.intellij.guice.model;
 import com.intellij.openapi.progress.ProgressManager;
 import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.psi.PsiElement;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.jetbrains.annotations.NotNull;
@@ -258,13 +263,26 @@ public final class GuiceNavigationIndex {
    * @return the set of matching entries (never null, may be empty)
    */
   public @NotNull Set<GuiceEntry> findCounterparts(@NotNull GuiceEntry entry) {
+    return findCounterparts(entry, null, GuiceEntry::isValid);
+  }
+
+  /**
+   * {@link #findCounterparts(GuiceEntry)} for a highlighting pass.
+   *
+   * @param overlay the fresh entries of one file, which replace the stored entries of that file, or {@code null}
+   * @param alive   tells if a candidate still exists: {@link GuiceEntry#isValid} restores its PSI element,
+   *                {@link GuiceEntry#isInValidFile} does not
+   */
+  @NotNull Set<GuiceEntry> findCounterparts(@NotNull GuiceEntry entry,
+                                            @Nullable GuiceFileOverlay overlay,
+                                            @NotNull Predicate<? super GuiceEntry> alive) {
     lock.readLock().lock();
     try {
       String fqn = entry.getKey().getTypeFqn();
       if (fqn == null) return Set.of();
 
-      Set<GuiceEntry> candidates = entriesByTypeFqn.get(fqn);
-      if (candidates == null || candidates.isEmpty()) return Set.of();
+      Collection<GuiceEntry> candidates = candidatesOfType(fqn, overlay);
+      if (candidates.isEmpty()) return Set.of();
 
       EntryRole oppositeRole = entry.getRole() == EntryRole.INJECTION_POINT
           ? EntryRole.BINDING_SITE
@@ -274,7 +292,7 @@ public final class GuiceNavigationIndex {
       for (GuiceEntry candidate : candidates) {
         if (candidate.getRole() == oppositeRole
             && entry.getKey().matches(candidate.getKey())
-            && candidate.isValid()) {
+            && alive.test(candidate)) {
           result.add(candidate);
         }
       }
@@ -291,7 +309,7 @@ public final class GuiceNavigationIndex {
         }
       }
       else if (entry.isDefaultBinding() && !result.isEmpty()) {
-        result.removeIf(cp -> hasExplicitBinding(candidates, cp.getKey()));
+        result.removeIf(cp -> hasExplicitBinding(candidates, cp.getKey(), alive));
       }
       return result;
     }
@@ -300,12 +318,14 @@ public final class GuiceNavigationIndex {
     }
   }
 
-  private static boolean hasExplicitBinding(@NotNull Set<GuiceEntry> candidates, @NotNull GuiceBindingKey key) {
+  private static boolean hasExplicitBinding(@NotNull Collection<GuiceEntry> candidates,
+                                            @NotNull GuiceBindingKey key,
+                                            @NotNull Predicate<? super GuiceEntry> alive) {
     for (GuiceEntry candidate : candidates) {
       if (candidate.getRole() == EntryRole.BINDING_SITE
           && !candidate.isDefaultBinding()
           && key.matches(candidate.getKey())
-          && candidate.isValid()) {
+          && alive.test(candidate)) {
         return true;
       }
     }
@@ -313,23 +333,63 @@ public final class GuiceNavigationIndex {
   }
 
   /**
+   * Returns the entries of a type. With an overlay, the entries of the overlay stand for the stored entries
+   * of its file. The caller holds the read lock.
+   */
+  private @NotNull Collection<GuiceEntry> candidatesOfType(@NotNull String fqn, @Nullable GuiceFileOverlay overlay) {
+    Set<GuiceEntry> stored = entriesByTypeFqn.get(fqn);
+    if (overlay == null) return stored != null ? stored : Set.of();
+
+    FileEntries storedOfFile = entriesByFile.get(overlay.path());
+    Set<GuiceEntry> replaced = storedOfFile != null ? storedOfFile.keyToEntries().get(fqn) : null;
+    Set<GuiceEntry> fresh = overlay.entriesOfType(fqn);
+    if (replaced == null && fresh.isEmpty()) return stored != null ? stored : Set.of();
+
+    List<GuiceEntry> result = new ArrayList<>((stored != null ? stored.size() : 0) + fresh.size());
+    if (stored != null) {
+      if (replaced == null) {
+        result.addAll(stored);
+      }
+      else {
+        // By identity: the per-file set and the per-type set hold the same instances, and entry equality
+        // compares smart pointers.
+        Set<GuiceEntry> replacedInstances = Collections.newSetFromMap(new IdentityHashMap<>());
+        replacedInstances.addAll(replaced);
+        for (GuiceEntry candidate : stored) {
+          if (!replacedInstances.contains(candidate)) result.add(candidate);
+        }
+      }
+    }
+    result.addAll(fresh);
+    return result;
+  }
+
+  /**
    * Finds all entries of a specific role that match the given binding key.
    * Used by the annotator when it has a key but no entry yet (e.g., JIT constructors).
    */
   public @NotNull Set<GuiceEntry> findByKey(@NotNull GuiceBindingKey key, @NotNull EntryRole role) {
+    return findByKey(key, role, null, GuiceEntry::isValid);
+  }
+
+  /**
+   * {@link #findByKey(GuiceBindingKey, EntryRole)} for a highlighting pass,
+   * see {@link #findCounterparts(GuiceEntry, GuiceFileOverlay, Predicate)}.
+   */
+  @NotNull Set<GuiceEntry> findByKey(@NotNull GuiceBindingKey key,
+                                     @NotNull EntryRole role,
+                                     @Nullable GuiceFileOverlay overlay,
+                                     @NotNull Predicate<? super GuiceEntry> alive) {
     lock.readLock().lock();
     try {
       String fqn = key.getTypeFqn();
       if (fqn == null) return Set.of();
 
-      Set<GuiceEntry> candidates = entriesByTypeFqn.get(fqn);
-      if (candidates == null) return Set.of();
-
       Set<GuiceEntry> result = new HashSet<>();
-      for (GuiceEntry candidate : candidates) {
+      for (GuiceEntry candidate : candidatesOfType(fqn, overlay)) {
         if (candidate.getRole() == role
             && key.matches(candidate.getKey())
-            && candidate.isValid()) {
+            && alive.test(candidate)) {
           result.add(candidate);
         }
       }
@@ -352,10 +412,21 @@ public final class GuiceNavigationIndex {
    * @return entries anchored at this element (never null, may be empty)
    */
   public @NotNull Set<GuiceEntry> findEntriesByAnchor(@NotNull PsiElement anchor) {
+    return findEntriesByAnchor(anchor, null);
+  }
+
+  /**
+   * {@link #findEntriesByAnchor(PsiElement)} for a highlighting pass: an anchor in the file of the overlay
+   * gets the entries of the overlay.
+   */
+  @NotNull Set<GuiceEntry> findEntriesByAnchor(@NotNull PsiElement anchor, @Nullable GuiceFileOverlay overlay) {
+    GuiceEntry.AnchorKey key = GuiceEntry.AnchorKey.of(anchor);
+    if (key == null) return Set.of();
+    if (overlay != null && overlay.path().equals(key.filePath())) {
+      return new HashSet<>(overlay.entriesAt(key));
+    }
     lock.readLock().lock();
     try {
-      GuiceEntry.AnchorKey key = GuiceEntry.AnchorKey.of(anchor);
-      if (key == null) return Set.of();
       Set<GuiceEntry> entries = entriesByAnchor.get(key);
       return entries != null ? new HashSet<>(entries) : Set.of();
     }
@@ -415,7 +486,7 @@ public final class GuiceNavigationIndex {
     return old;
   }
 
-  private static @NotNull Map<String, Set<GuiceEntry>> groupByTypeFqn(@NotNull Set<GuiceEntry> entries) {
+  static @NotNull Map<String, Set<GuiceEntry>> groupByTypeFqn(@NotNull Set<GuiceEntry> entries) {
     if (entries.isEmpty()) return Map.of();
     Map<String, Set<GuiceEntry>> keyToEntries = new HashMap<>();
     for (GuiceEntry entry : entries) {

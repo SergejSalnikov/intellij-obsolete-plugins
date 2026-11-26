@@ -88,6 +88,35 @@ public class GuiceIntentionsTest extends GuiceTestBase {
   }
 
   /**
+   * A local class has no qualified name, so the annotation would be {@code @ImplementedBy(null.class)}.
+   * {@code @ImplementedBy} and {@code @ProvidedBy} cannot express the type arguments of a {@code TypeLiteral},
+   * so the annotation would bind every parameterization of the class.
+   */
+  public void testMoveToClassIsNotOfferedForLocalClassesAndParameterizedTypes() {
+    myFixture.addFileToProject("test/Foo.java", "package test;\npublic interface Foo {}\n");
+    myFixture.addFileToProject("test/Box.java", "package test;\npublic interface Box<T> {}\n");
+    myFixture.addFileToProject("test/StringBox.java", "package test;\npublic class StringBox implements Box<String> {}\n");
+    myFixture.addFileToProject("test/GenericBox.java", "package test;\npublic class GenericBox<T> implements Box<T> {}\n");
+
+    configureModule("class LocalImpl implements Foo {}\n        bind(Foo.class).t<caret>o(LocalImpl.class);");
+    assertThat(intentionTexts()).doesNotContain("Move binding class to class");
+
+    configureModule("class LocalProvider implements javax.inject.Provider<Foo> { public Foo get() { return null; } }\n" +
+                    "        bind(Foo.class).toProv<caret>ider(LocalProvider.class);");
+    assertThat(intentionTexts()).doesNotContain("Move provider binding to class");
+
+    configureModule("bind(new com.google.inject.TypeLiteral<Box<String>>() {}).t<caret>o(StringBox.class);");
+    assertThat(intentionTexts()).doesNotContain("Move binding class to class");
+
+    configureModule("bind(Box.class).t<caret>o(new com.google.inject.TypeLiteral<GenericBox<String>>() {});");
+    assertThat(intentionTexts()).doesNotContain("Move binding class to class");
+
+    // A raw generic class is a plain key: the annotation says the same as the binding.
+    configureModule("bind(Box.class).t<caret>o(StringBox.class);");
+    assertThat(intentionTexts()).contains("Move binding class to class");
+  }
+
+  /**
    * M12: the intentions edit Java PSI; a Kotlin class (a light class) is not a target they can annotate.
    */
   public void testMoveIntentionsAreNotOfferedWhenTheTargetClassIsKotlin() {

@@ -11,6 +11,7 @@ import com.intellij.java.library.JavaLibraryUtil;
 import com.intellij.openapi.Disposable;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.components.Service;
+import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.fileEditor.FileEditor;
 import com.intellij.openapi.fileEditor.FileEditorManager;
 import com.intellij.openapi.fileTypes.FileTypeRegistry;
@@ -26,23 +27,23 @@ import com.intellij.psi.PsiClassOwner;
 import com.intellij.psi.PsiCompiledElement;
 import com.intellij.psi.PsiCompiledFile;
 import com.intellij.psi.PsiElement;
-import com.intellij.psi.PsiField;
 import com.intellij.psi.PsiFile;
 import com.intellij.psi.PsiManager;
-import com.intellij.psi.PsiMethod;
-import com.intellij.psi.PsiReference;
 import com.intellij.psi.PsiTreeChangeAdapter;
 import com.intellij.psi.PsiTreeChangeEvent;
 import com.intellij.psi.search.GlobalSearchScope;
+import com.intellij.psi.util.PsiModificationTracker;
 import com.intellij.psi.search.searches.AnnotatedElementsSearch;
 import com.intellij.psi.search.searches.ReferencesSearch;
 import com.intellij.testFramework.LightVirtualFile;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -78,6 +79,9 @@ import org.jetbrains.annotations.Nls;
  *       for VFS events or {@link GuicePsiTreeChangeListener} for in-memory PSI edits),
  *       it is added to a dirty set. A debounced background task processes dirty files
  *       one file per read action, then triggers re-highlighting via {@code DaemonCodeAnalyzer.restart()}.</li>
+ *   <li><b>Read-only highlighting passes</b>: A line marker pass does not write to the index. When the index
+ *       is behind on the highlighted file, the pass takes the entries of that file from its PSI
+ *       ({@link #getNavigationView}), and the background task stores the same entries later.</li>
  *   <li><b>Initial population</b>: On first access (or after a structure change), background
  *       population runs fine-grained discovery steps and per-file extraction, skipping files
  *       whose modification stamps and structure generation are already up to date.</li>
@@ -91,6 +95,7 @@ import org.jetbrains.annotations.Nls;
  */
 @Service(Service.Level.PROJECT)
 public final class GuiceProjectModel implements Disposable {
+  private static final Logger LOG = Logger.getInstance(GuiceProjectModel.class);
 
   /**
    * What a discovery step looks for. The label names the kind in the progress text of the step.
@@ -209,11 +214,43 @@ public final class GuiceProjectModel implements Disposable {
   private final Set<String> myPendingRestartTypeFqns = ConcurrentHashMap.newKeySet();
 
   /**
-   * Files to re-highlight when the current daemon cycle finishes. Filled by {@link #ensureFileCurrent},
-   * which runs inside a highlighting pass: a restart from there would cancel the pass that just
-   * computed fresh gutter icons. Drained by the {@link DaemonCodeAnalyzer.DaemonListener} of this service.
+   * Files to re-highlight when the current daemon cycle finishes. Filled by an update that runs inside a
+   * highlighting pass, which only the synchronous mode of the tests has: a restart from there would cancel
+   * the pass. Drained by the {@link DaemonCodeAnalyzer.DaemonListener} of this service.
    */
   private final Set<VirtualFile> myFilesToRestartWhenDaemonFinishes = ConcurrentHashMap.newKeySet();
+
+  /**
+   * The entries that a highlighting pass extracted from the PSI of its file, because the index was behind on
+   * the file. See {@link #findOverlay}.
+   *
+   * @param psiStamp             the modification stamp of the file
+   * @param generation           the structure generation
+   * @param psiModificationCount the project-wide PSI modification count: the entries of a file also depend
+   *                             on the classes that it references
+   * @param overlay              the entries, or {@code null} when the extraction of this PSI state failed
+   */
+  private record PassExtraction(long psiStamp, int generation, long psiModificationCount, @Nullable GuiceFileOverlay overlay) {
+    boolean isFor(long psiStamp, int generation, long psiModificationCount) {
+      return this.psiStamp == psiStamp && this.generation == generation && this.psiModificationCount == psiModificationCount;
+    }
+  }
+
+  /**
+   * The extraction of the last highlighting pass of a file, keyed by file path. A memo, not a second index:
+   * an entry lives from the pass that needs it to the background update of the file, which stores the
+   * same result in {@link #myNavigationIndex}. The service owns it, not a {@code CachedValue} on the PSI file:
+   * the provider of such a value stays in the PSI user data and keeps the plugin class loader alive after
+   * a dynamic unload.
+   */
+  private final ConcurrentHashMap<String, PassExtraction> myPassExtractions = new ConcurrentHashMap<>();
+
+  /**
+   * Type FQNs whose entries changed in a file by an update that stored the {@link PassExtraction} of that
+   * file. The pass of the file has shown the result already, so {@link #requestRestartOfAffectedEditors}
+   * re-highlights the other files that show these types, and the file itself only for another reason.
+   */
+  private final ConcurrentHashMap<VirtualFile, Set<String>> myTypeFqnsShownByPass = new ConcurrentHashMap<>();
 
   // -----------------------------------------------------------------------
   // Construction / service access
@@ -278,6 +315,75 @@ public final class GuiceProjectModel implements Disposable {
       myBackgroundUpdater.processDirtyFilesNow();
     }
     return myNavigationIndex;
+  }
+
+  /**
+   * Returns what a line marker pass of {@code psiFile} sees. The call only reads the index. When the index is
+   * behind on the file, because the background update has not processed an edit yet, the entries of the file
+   * come from its PSI, and the index stays as it is. The background update stores the same entries later.
+   *
+   * <p>Like {@link #getNavigationIndex}, the first call requests the population of the index.
+   * Must be called under a read action.
+   */
+  @NotNull GuiceNavigationView getNavigationView(@NotNull Module module, @NotNull PsiFile psiFile) {
+    GuiceNavigationIndex index = getNavigationIndex(module);
+    return new GuiceNavigationView(index, findOverlay(psiFile));
+  }
+
+  /**
+   * Returns the entries of the file from its PSI, or {@code null} when the index is current for the file.
+   *
+   * <p>The extraction is memoized for the PSI state that it was made from. The two passes of a highlighting
+   * cycle, the two line marker providers and the background update share one extraction.
+   */
+  private @Nullable GuiceFileOverlay findOverlay(@NotNull PsiFile psiFile) {
+    if (!(psiFile instanceof PsiClassOwner) || !isIndexableProjectFile(psiFile)) return null;
+    VirtualFile vf = psiFile.getVirtualFile();
+    String path = vf.getPath();
+    long psiStamp = psiFile.getModificationStamp();
+    int generation = myStructureGeneration.get();
+    if (!myDirtyFiles.contains(vf)) {
+      FileStamp recorded = myFileStamps.get(path);
+      boolean current = recorded != null
+                        ? recorded.psiStamp() == psiStamp && recorded.generation() == generation
+                        // No record after a complete population: the discovery found nothing in the file.
+                        : !isPopulationNeeded();
+      if (current) {
+        myPassExtractions.remove(path);
+        return null;
+      }
+    }
+
+    long psiModificationCount = PsiModificationTracker.getInstance(myProject).getModificationCount();
+    PassExtraction memo = myPassExtractions.get(path);
+    if (memo != null && memo.isFor(psiStamp, generation, psiModificationCount)) {
+      return memo.overlay();
+    }
+    GuiceEntryProducer.FileExtractionResult result;
+    try {
+      result = GuiceEntryProducer.extractFileData(psiFile);
+    }
+    catch (Throwable t) {
+      GuiceExtensionIndex.rethrowIfControlFlow(t);
+      // The pass shows the stored entries then. The failure is remembered, so the next pass of the same
+      // PSI state does not extract and log again.
+      LOG.warn("Cannot extract Guice entries from " + path, t);
+      myPassExtractions.put(path, new PassExtraction(psiStamp, generation, psiModificationCount, null));
+      return null;
+    }
+    GuiceFileOverlay overlay = new GuiceFileOverlay(path, result);
+    myPassExtractions.put(path, new PassExtraction(psiStamp, generation, psiModificationCount, overlay));
+    return overlay;
+  }
+
+  /**
+   * Returns the entries that a highlighting pass extracted from the PSI state of {@code stamp}, or {@code null}.
+   */
+  private @Nullable GuiceFileOverlay findPassExtraction(@NotNull String path, @NotNull FileStamp stamp) {
+    PassExtraction memo = myPassExtractions.get(path);
+    if (memo == null) return null;
+    long psiModificationCount = PsiModificationTracker.getInstance(myProject).getModificationCount();
+    return memo.isFor(stamp.psiStamp(), stamp.generation(), psiModificationCount) ? memo.overlay() : null;
   }
 
   private @Nullable VirtualFile resolveVirtualFile(@NotNull String path) {
@@ -367,6 +473,7 @@ public final class GuiceProjectModel implements Disposable {
     myFileStamps.remove(path);
     myDirtyFiles.remove(file);
     myForcedDirtyFiles.remove(file);
+    myPassExtractions.remove(path);
 
     if (file.isDirectory()) {
       String prefix = path + "/";
@@ -379,6 +486,7 @@ public final class GuiceProjectModel implements Disposable {
       myFileStamps.keySet().removeIf(p -> p.startsWith(prefix));
       myDirtyFiles.removeIf(vf -> vf.getPath().startsWith(prefix));
       myForcedDirtyFiles.removeIf(vf -> vf.getPath().startsWith(prefix));
+      myPassExtractions.keySet().removeIf(p -> p.startsWith(prefix));
     }
 
     boolean queued = false;
@@ -405,8 +513,25 @@ public final class GuiceProjectModel implements Disposable {
    * @return whether the update changed the index
    */
   private boolean recordUpdate(@NotNull GuiceNavigationIndex.FileUpdate update) {
+    return recordUpdate(update, null);
+  }
+
+  /**
+   * @param shownIn the file whose highlighting pass has shown the result of the update already
+   *                (see {@link #myTypeFqnsShownByPass}), or {@code null}
+   */
+  private boolean recordUpdate(@NotNull GuiceNavigationIndex.FileUpdate update, @Nullable VirtualFile shownIn) {
     if (update.changed()) {
-      myPendingRestartTypeFqns.addAll(update.affectedTypeFqns());
+      if (shownIn == null) {
+        myPendingRestartTypeFqns.addAll(update.affectedTypeFqns());
+      }
+      else {
+        myTypeFqnsShownByPass.merge(shownIn, update.affectedTypeFqns(), (first, second) -> {
+          Set<String> union = new HashSet<>(first);
+          union.addAll(second);
+          return union;
+        });
+      }
     }
     return update.changed();
   }
@@ -422,6 +547,8 @@ public final class GuiceProjectModel implements Disposable {
    */
   void markStructureChanged() {
     myStructureGeneration.incrementAndGet();
+    // They belong to the old generation.
+    myPassExtractions.clear();
     if (!ApplicationManager.getApplication().isUnitTestMode() && !myProject.isDisposed()) {
       DaemonCodeAnalyzer.getInstance(myProject).restart("Guice project structure changed");
     }
@@ -468,7 +595,9 @@ public final class GuiceProjectModel implements Disposable {
     // Read action first, then the index lock: entry equality takes a read action (smart pointers).
     ReadAction.run(myNavigationIndex::clear);
     myFileStamps.clear();
+    myPassExtractions.clear();
     myPendingRestartTypeFqns.clear();
+    myTypeFqnsShownByPass.clear();
     myFilesToRestartWhenDaemonFinishes.clear();
     markStructureChanged();
   }
@@ -496,6 +625,7 @@ public final class GuiceProjectModel implements Disposable {
     myFileStamps.clear();
     myDirtyFiles.clear();
     myForcedDirtyFiles.clear();
+    myPassExtractions.clear();
     myFilesByPath.clear();
     myDirtyDirectories.clear();
     myPopulatedGeneration = NOT_POPULATED;
@@ -536,7 +666,7 @@ public final class GuiceProjectModel implements Disposable {
    * complete for {@code generation}.
    *
    * <p>A file is kept when discovery listed it in {@code processedFiles}, or when its {@link FileStamp}
-   * carries {@code generation}: the dirty drain and {@link #ensureFileCurrent} process a file that was
+   * carries {@code generation}: the dirty drain processes a file that was
    * edited during the pass with the current generation, and such a file is current although discovery
    * did not list it.
    */
@@ -612,10 +742,11 @@ public final class GuiceProjectModel implements Disposable {
 
     // 4. Guice module files (for bindings defined in configure())
     steps.add(new DiscoveryStep(DiscoveryKind.MODULES, () -> {
-      Set<VirtualFile> files = new LinkedHashSet<>();
-      for (PsiClass cls : GuiceInjectorManager.getGuiceModuleClasses(module, scope)) {
+      Set<VirtualFile> files = newDiscoveredFileSet();
+      GuiceInjectorManager.processGuiceModuleClasses(module, scope, cls -> {
         addFileOf(cls, files);
-      }
+        return true;
+      });
       recordDiscoveredFiles(files);
       return files;
     }));
@@ -638,13 +769,15 @@ public final class GuiceProjectModel implements Disposable {
                                                                          @NotNull GlobalSearchScope scope) {
     PsiClass annoClass = JavaPsiFacade.getInstance(myProject).findClass(annoFqn, GlobalSearchScope.allScope(myProject));
     if (annoClass == null) return Set.of();
-    Set<VirtualFile> files = new LinkedHashSet<>();
-    for (PsiField field : AnnotatedElementsSearch.searchPsiFields(annoClass, scope).findAll()) {
+    Set<VirtualFile> files = newDiscoveredFileSet();
+    AnnotatedElementsSearch.searchPsiFields(annoClass, scope).forEach(field -> {
       addFileOf(field, files);
-    }
-    for (PsiMethod method : AnnotatedElementsSearch.searchPsiMethods(annoClass, scope).findAll()) {
+      return true;
+    });
+    AnnotatedElementsSearch.searchPsiMethods(annoClass, scope).forEach(method -> {
       addFileOf(method, files);
-    }
+      return true;
+    });
     recordDiscoveredFiles(files);
     return files;
   }
@@ -653,10 +786,11 @@ public final class GuiceProjectModel implements Disposable {
                                                                 @NotNull GlobalSearchScope scope) {
     PsiClass annoClass = JavaPsiFacade.getInstance(myProject).findClass(annoFqn, GlobalSearchScope.allScope(myProject));
     if (annoClass == null) return Set.of();
-    Set<VirtualFile> files = new LinkedHashSet<>();
-    for (PsiMethod method : AnnotatedElementsSearch.searchPsiMethods(annoClass, scope).findAll()) {
+    Set<VirtualFile> files = newDiscoveredFileSet();
+    AnnotatedElementsSearch.searchPsiMethods(annoClass, scope).forEach(method -> {
       addFileOf(method, files);
-    }
+      return true;
+    });
     recordDiscoveredFiles(files);
     return files;
   }
@@ -665,10 +799,11 @@ public final class GuiceProjectModel implements Disposable {
                                                                 @NotNull GlobalSearchScope scope) {
     PsiClass annoClass = JavaPsiFacade.getInstance(myProject).findClass(annoFqn, GlobalSearchScope.allScope(myProject));
     if (annoClass == null) return Set.of();
-    Set<VirtualFile> files = new LinkedHashSet<>();
-    for (PsiClass cls : AnnotatedElementsSearch.searchPsiClasses(annoClass, scope).findAll()) {
+    Set<VirtualFile> files = newDiscoveredFileSet();
+    AnnotatedElementsSearch.searchPsiClasses(annoClass, scope).forEach(cls -> {
       addFileOf(cls, files);
-    }
+      return true;
+    });
     recordDiscoveredFiles(files);
     return files;
   }
@@ -677,12 +812,21 @@ public final class GuiceProjectModel implements Disposable {
                                                             @NotNull GlobalSearchScope scope) {
     PsiClass ownerClass = JavaPsiFacade.getInstance(myProject).findClass(ownerFqn, GlobalSearchScope.allScope(myProject));
     if (ownerClass == null) return Set.of();
-    Set<VirtualFile> files = new LinkedHashSet<>();
-    for (PsiReference ref : ReferencesSearch.search(ownerClass, scope).findAll()) {
+    Set<VirtualFile> files = newDiscoveredFileSet();
+    ReferencesSearch.search(ownerClass, scope).forEach(ref -> {
       addFileOf(ref.getElement(), files);
-    }
+      return true;
+    });
     recordDiscoveredFiles(files);
     return files;
+  }
+
+  /**
+   * The result set of a discovery search. A search gives each element to a processor, so no list of all
+   * elements is built, and it may call the processor on several threads.
+   */
+  private static @NotNull Set<VirtualFile> newDiscoveredFileSet() {
+    return ConcurrentHashMap.newKeySet();
   }
 
   private void recordDiscoveredFiles(@NotNull Set<VirtualFile> files) {
@@ -780,7 +924,7 @@ public final class GuiceProjectModel implements Disposable {
     catch (Throwable t) {
       GuiceExtensionIndex.rethrowIfControlFlow(t);
       // The file leaves the dirty set, or the drain would loop on it forever. Its stamp is not recorded,
-      // so the next highlighting pass or edit of the file retries the extraction.
+      // so the next edit of the file retries the extraction.
       myDirtyFiles.remove(file);
       throw t;
     }
@@ -848,10 +992,18 @@ public final class GuiceProjectModel implements Disposable {
     if (failureForTests != null && failureForTests.test(vf)) {
       throw new IllegalStateException("Simulated extraction failure for " + path);
     }
-    GuiceEntryProducer.FileExtractionResult result =
-        fileForExtraction instanceof PsiClassOwner
-        ? GuiceEntryProducer.extractFileData(fileForExtraction)
-        : GuiceEntryProducer.FileExtractionResult.EMPTY;
+    // A highlighting pass of the file may have extracted this PSI state already: then the pass has shown
+    // the entries, and this update stores the same ones.
+    GuiceFileOverlay shownByPass = fileForExtraction == psiFile ? findPassExtraction(path, currentStamp) : null;
+    GuiceEntryProducer.FileExtractionResult result;
+    if (shownByPass != null) {
+      result = shownByPass.result();
+    }
+    else {
+      result = fileForExtraction instanceof PsiClassOwner
+               ? GuiceEntryProducer.extractFileData(fileForExtraction)
+               : GuiceEntryProducer.FileExtractionResult.EMPTY;
+    }
 
     // A structure or contributor change during Phase 1 invalidates the result: the entries may hold objects
     // of a removed contributor. Leave the file for the next population or drain, which uses the new generation.
@@ -864,8 +1016,9 @@ public final class GuiceProjectModel implements Disposable {
     for (VirtualFile targetVf : result.referencedTargetFiles()) {
       myFilesByPath.put(targetVf.getPath(), targetVf);
     }
-    boolean changed = recordUpdate(myNavigationIndex.updateFile(path, result));
+    boolean changed = recordUpdate(myNavigationIndex.updateFile(path, result), shownByPass != null ? vf : null);
     myFileStamps.put(path, currentStamp);
+    myPassExtractions.remove(path);
     if (fromDirtySet) {
       myDirtyFiles.remove(vf);
       myForcedDirtyFiles.remove(vf);
@@ -890,8 +1043,8 @@ public final class GuiceProjectModel implements Disposable {
         }
       }
       if (queued) {
-        // A highlighting pass (ensureFileCurrent) may be the caller: without a request, the queued files would
-        // wait for the next unrelated event. A running drain ignores the extra request.
+        // The population may be the caller: without a request, the queued files would wait for the next
+        // unrelated event. A running drain ignores the extra request.
         myBackgroundUpdater.scheduleDirtyProcessing();
       }
     }
@@ -907,38 +1060,6 @@ public final class GuiceProjectModel implements Disposable {
   private boolean queueForcedReextraction(@NotNull VirtualFile registrarVf) {
     myForcedDirtyFiles.add(registrarVf);
     return myDirtyFiles.add(registrarVf);
-  }
-
-  // -----------------------------------------------------------------------
-  // Current-file freshness for line marker providers
-  // -----------------------------------------------------------------------
-
-  /**
-   * Brings the index up to date for the file of a running highlighting pass.
-   *
-   * <p>The line marker providers call it first, so the first pass after an edit already shows the new
-   * gutter icons instead of lagging one pass behind the background update. The work is the same
-   * two-phase atomic update that the background uses; it removes the file from the dirty set, so the
-   * background does not repeat it. A file that no longer differs from its recorded stamp costs two map
-   * lookups. Other open files whose counterparts changed are re-highlighted when the current daemon cycle
-   * finishes, so this pass is not cancelled.
-   *
-   * <p>Must be called under a read action.
-   */
-  void ensureFileCurrent(@NotNull PsiFile psiFile) {
-    if (!isIndexActive() || !isIndexableProjectFile(psiFile)) return;
-    VirtualFile vf = psiFile.getVirtualFile();
-    if (!myDirtyFiles.contains(vf)) {
-      FileStamp recordedStamp = myFileStamps.get(vf.getPath());
-      if (recordedStamp != null
-          && recordedStamp.psiStamp() == psiFile.getModificationStamp()
-          && recordedStamp.generation() == myStructureGeneration.get()) {
-        return;
-      }
-    }
-    if (processSingleDirtyFile(vf)) {
-      requestRestartOfAffectedEditors(RestartMode.WHEN_DAEMON_FINISHES, vf);
-    }
   }
 
   // -----------------------------------------------------------------------
@@ -962,19 +1083,34 @@ public final class GuiceProjectModel implements Disposable {
    * updates since the previous call. Only the files with entries of the affected types are restarted,
    * instead of every open editor.
    *
-   * @param excludedFile a file that is current already, for example the file of the running pass
+   * <p>A file whose own update stored the entries that its highlighting pass has shown already
+   * ({@link #myTypeFqnsShownByPass}) is restarted only when an update of another file affects it.
    */
-  void requestRestartOfAffectedEditors(@NotNull RestartMode mode, @Nullable VirtualFile excludedFile) {
-    if (myPendingRestartTypeFqns.isEmpty() || myProject.isDisposed()) return;
+  void requestRestartOfAffectedEditors(@NotNull RestartMode mode) {
+    if (myProject.isDisposed() || (myPendingRestartTypeFqns.isEmpty() && myTypeFqnsShownByPass.isEmpty())) return;
     Set<String> typeFqns = new HashSet<>(myPendingRestartTypeFqns);
     myPendingRestartTypeFqns.removeAll(typeFqns);
+    Map<VirtualFile, Set<String>> shownByPass = new HashMap<>();
+    for (VirtualFile file : new ArrayList<>(myTypeFqnsShownByPass.keySet())) {
+      Set<String> shown = myTypeFqnsShownByPass.remove(file);
+      if (shown != null) shownByPass.put(file, shown);
+    }
 
-    Set<VirtualFile> files = myNavigationIndex.getFilesWithEntriesOfTypes(typeFqns);
-    // An open file that declares an affected type holds no entry of its own when the type is an interface
-    // or has no @Inject member, but its class gutter shows the bindings of the type.
-    files.addAll(openFilesDeclaringTypes(typeFqns));
-    if (excludedFile != null) {
-      files.remove(excludedFile);
+    Set<String> allTypeFqns = new HashSet<>(typeFqns);
+    for (Set<String> shown : shownByPass.values()) {
+      allTypeFqns.addAll(shown);
+    }
+    Set<VirtualFile> files = filesShowingTypes(allTypeFqns);
+    for (VirtualFile shownFile : shownByPass.keySet()) {
+      if (!files.contains(shownFile)) continue;
+      // The types that updates of other files changed.
+      Set<String> otherTypeFqns = new HashSet<>(typeFqns);
+      for (Map.Entry<VirtualFile, Set<String>> other : shownByPass.entrySet()) {
+        if (!other.getKey().equals(shownFile)) otherTypeFqns.addAll(other.getValue());
+      }
+      if (otherTypeFqns.isEmpty() || !filesShowingTypes(otherTypeFqns).contains(shownFile)) {
+        files.remove(shownFile);
+      }
     }
     if (files.isEmpty()) return;
 
@@ -987,6 +1123,17 @@ public final class GuiceProjectModel implements Disposable {
   }
 
   /**
+   * Returns the files whose gutter icons show entries of the types: the files with entries of the types, and
+   * the open files that declare one of the types. Such an open file holds no entry of its own when the type
+   * is an interface or has no {@code @Inject} member, but its class gutter shows the bindings of the type.
+   */
+  private @NotNull Set<VirtualFile> filesShowingTypes(@NotNull Set<String> typeFqns) {
+    Set<VirtualFile> files = myNavigationIndex.getFilesWithEntriesOfTypes(typeFqns);
+    files.addAll(openFilesDeclaringTypes(typeFqns));
+    return files;
+  }
+
+  /**
    * Returns the open files that declare a class whose qualified name is in {@code typeFqns}. Reads the
    * class names from the stubs; open editors are few, so this is cheap.
    */
@@ -994,7 +1141,8 @@ public final class GuiceProjectModel implements Disposable {
     if (myProject.isDisposed()) return Set.of();
     VirtualFile[] openFiles = FileEditorManager.getInstance(myProject).getOpenFiles();
     if (openFiles.length == 0) return Set.of();
-    return ReadAction.compute(() -> {
+    // The callers are the background updater, which holds no read action, and a highlighting pass, which holds one.
+    return ReadAction.nonBlocking(() -> {
       Set<VirtualFile> result = new HashSet<>();
       PsiManager psiManager = PsiManager.getInstance(myProject);
       for (VirtualFile openFile : openFiles) {
@@ -1005,7 +1153,7 @@ public final class GuiceProjectModel implements Disposable {
         }
       }
       return result;
-    });
+    }).executeSynchronously();
   }
 
   private static boolean declaresAnyOf(PsiClass @NotNull [] classes, @NotNull Set<String> typeFqns) {
@@ -1060,6 +1208,7 @@ public final class GuiceProjectModel implements Disposable {
   @TestOnly
   void clearPendingRestartsForTests() {
     myPendingRestartTypeFqns.clear();
+    myTypeFqnsShownByPass.clear();
     myFilesToRestartWhenDaemonFinishes.clear();
   }
 

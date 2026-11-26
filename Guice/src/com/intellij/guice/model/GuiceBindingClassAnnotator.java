@@ -5,11 +5,11 @@ import com.intellij.codeInsight.daemon.RelatedItemLineMarkerInfo;
 import com.intellij.guice.GuiceBundle;
 import com.intellij.guice.GuiceIcons;
 import com.intellij.guice.model.renderers.GuiceEntryTargetRenderer;
-import com.intellij.openapi.module.Module;
-import com.intellij.openapi.module.ModuleUtilCore;
 import com.intellij.psi.PsiClass;
 import com.intellij.psi.PsiElement;
 import com.intellij.psi.PsiNameIdentifierOwner;
+import com.intellij.psi.SmartPointerManager;
+import com.intellij.psi.SmartPsiElementPointer;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.uast.UAnnotation;
 import org.jetbrains.uast.UClass;
@@ -21,9 +21,7 @@ import org.jetbrains.uast.UastUtils;
 import javax.swing.Icon;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 /**
  * Class-level gutter icon: shows which {@code bind()} calls reference this class.
@@ -50,8 +48,9 @@ public final class GuiceBindingClassAnnotator extends GuiceLineMarkerProviderBas
   }
 
   @Override
-  protected void collectNavigationMarkers(@NotNull PsiElement psiElement,
-                                          @NotNull Collection<? super RelatedItemLineMarkerInfo<?>> result) {
+  protected void collectGuiceMarkers(@NotNull PsiElement psiElement,
+                                     @NotNull PassContext context,
+                                     @NotNull Collection<? super RelatedItemLineMarkerInfo<?>> result) {
     final PsiElement parent = psiElement.getParent();
     if (!(parent instanceof PsiNameIdentifierOwner nio)
         || !psiElement.equals(nio.getNameIdentifier())) {
@@ -63,48 +62,64 @@ public final class GuiceBindingClassAnnotator extends GuiceLineMarkerProviderBas
     final PsiClass psiClass = uClass.getJavaPsi();
     if (psiClass.getQualifiedName() == null) return;
 
-    final Module module = ModuleUtilCore.findModuleForPsiElement(psiElement);
-    if (module == null || !GuiceProjectModel.isGuiceAvailable(module)) return;
-
-    GuiceProjectModel model = GuiceProjectModel.getInstance(module.getProject());
-
     // Find all BINDING_SITE entries whose type matches this class.
     GuiceBindingKey key = GuiceBindingKey.forClass(psiClass);
-    GuiceNavigationIndex navIndex = model.getNavigationIndex(module);
-    Set<GuiceEntry> bindings = new HashSet<>(navIndex.findByKey(key, EntryRole.BINDING_SITE));
+    GuiceNavigationView view = context.view();
+    List<GuiceEntry> bindings = new ArrayList<>(view.findByKey(key, EntryRole.BINDING_SITE));
     // Bindings that use this class as the implementation: bind(Foo.class).to(ThisClass.class).
-    for (GuiceEntry entry : navIndex.findByKey(key, EntryRole.INJECTION_POINT)) {
+    for (GuiceEntry entry : view.findByKey(key, EntryRole.INJECTION_POINT)) {
       if (entry.isImplementationReference()) bindings.add(entry);
     }
+    // The pass needs to know only that a target exists. The gutter icon restores and sorts the targets on demand.
+    if (!hasTargetOutsideOf(bindings, psiClass)) return;
 
-    if (!bindings.isEmpty()) {
-      List<GuiceEntry> filteredEntries = new ArrayList<>(bindings.size());
-      for (GuiceEntry binding : bindings) {
-        PsiElement target = binding.getNavigationTarget();
-        if (target == null) continue;
+    List<GuiceEntry> entries = List.copyOf(bindings);
+    // The lazy values keep the entries (smart pointers), the sort context and a pointer to the class, not PSI.
+    // The pointer is to the source element: a pointer to the light class of a Kotlin class is a hard reference.
+    SmartPsiElementPointer<PsiElement> classPointer = SmartPointerManager.createPointer(parent);
+    GuiceEntryTargetRenderer.SortContext sortContext = GuiceEntryTargetRenderer.SortContext.of(psiElement);
+    final GuiceGutterIconBuilder builder = new GuiceGutterIconBuilder(GuiceIcons.GoogleSmall);
+    builder
+      .setPopupTitle(GuiceBundle.message("GuiceClassAnnotator.popup.title"))
+      .setTooltipText(GuiceBundle.message("GuiceClassAnnotator.popup.tooltip.text"))
+      .setEmptyPopupText(GuiceBundle.message("gutter.no.targets"))
+      .setTargetRenderer(() -> new GuiceEntryTargetRenderer(entries))
+      .setTargets(lazyTargets(() -> {
+        PsiElement classElement = classPointer.getElement();
+        UClass currentClass = classElement != null ? UastContextKt.toUElement(classElement, UClass.class) : null;
+        if (currentClass == null) return List.of();
+        List<GuiceEntry> navigable = withoutSelfReferences(entries, currentClass.getJavaPsi());
+        return GuiceEntryTargetRenderer.sortTargets(navigable, sortContext).targets();
+      }));
 
-        // Skip self-references: an @Inject constructor or an @ImplementedBy annotation of this class
-        // is a BINDING_SITE for the class's own type, but navigating from the
-        // class declaration to it is redundant.
-        if (isOwnConstructorOrAnnotation(target, psiClass)) {
-          continue;
-        }
+    result.add(builder.createGuiceLineMarkerInfo(psiElement));
+  }
 
-        filteredEntries.add(binding);
-      }
-      GuiceEntryTargetRenderer.SortedTargets sorted = GuiceEntryTargetRenderer.sortTargets(filteredEntries, psiElement);
-      if (!sorted.targets().isEmpty()) {
-        List<GuiceEntry> immutableEntries = sorted.entries();
-        final GuiceGutterIconBuilder builder = new GuiceGutterIconBuilder(GuiceIcons.GoogleSmall);
-        builder
-          .setPopupTitle(GuiceBundle.message("GuiceClassAnnotator.popup.title"))
-          .setTooltipText(GuiceBundle.message("GuiceClassAnnotator.popup.tooltip.text"))
-          .setTargetRenderer(() -> new GuiceEntryTargetRenderer(immutableEntries))
-          .setTargets(sorted.targets());
-
-        result.add(builder.createGuiceLineMarkerInfo(psiElement));
+  /**
+   * Returns the bindings to navigate to. A self-reference is not one of them: an {@code @Inject} constructor
+   * or an {@code @ImplementedBy} annotation of the class is a BINDING_SITE for the type of the class, but
+   * the navigation from the class declaration to it is redundant.
+   */
+  private static @NotNull List<GuiceEntry> withoutSelfReferences(@NotNull List<GuiceEntry> bindings, @NotNull PsiClass psiClass) {
+    List<GuiceEntry> result = new ArrayList<>(bindings.size());
+    for (GuiceEntry binding : bindings) {
+      PsiElement target = binding.getNavigationTarget();
+      if (target != null && !isOwnConstructorOrAnnotation(target, psiClass)) {
+        result.add(binding);
       }
     }
+    return result;
+  }
+
+  /**
+   * Tells if {@link #withoutSelfReferences} has one entry at least. It stops at the first one.
+   */
+  private static boolean hasTargetOutsideOf(@NotNull List<GuiceEntry> bindings, @NotNull PsiClass psiClass) {
+    for (GuiceEntry binding : bindings) {
+      PsiElement target = binding.getNavigationTarget();
+      if (target != null && !isOwnConstructorOrAnnotation(target, psiClass)) return true;
+    }
+    return false;
   }
 
   private static boolean isOwnConstructorOrAnnotation(@NotNull PsiElement target, @NotNull PsiClass psiClass) {

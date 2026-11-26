@@ -54,6 +54,18 @@ public final class GuiceEntryTargetRenderer extends PsiTargetPresentationRendere
   public record SortedTargets(@Unmodifiable @NotNull List<GuiceEntry> entries,
                               @Unmodifiable @NotNull List<PsiElement> targets) {}
 
+  /**
+   * What the order of the targets depends on: the file and the package of the element with the gutter icon.
+   * It holds no PSI, so the lazy target list of a line marker can keep it.
+   */
+  public record SortContext(@NotNull Project project, @Nullable VirtualFile file, String @NotNull [] packageSegments) {
+    public static @NotNull SortContext of(@NotNull PsiElement contextElement) {
+      PsiFile file = contextElement.getContainingFile();
+      VirtualFile virtualFile = file != null ? file.getVirtualFile() : null;
+      return new SortContext(contextElement.getProject(), virtualFile, getPackageSegments(file));
+    }
+  }
+
   private static final String[] EMPTY_SEGMENTS = new String[0];
 
   private record SortableEntry(@NotNull GuiceEntry entry,
@@ -114,13 +126,21 @@ public final class GuiceEntryTargetRenderer extends PsiTargetPresentationRendere
    */
   public static @NotNull SortedTargets sortTargets(@NotNull Collection<GuiceEntry> entries,
                                                    @NotNull PsiElement contextElement) {
+    return sortTargets(entries, SortContext.of(contextElement));
+  }
+
+  /**
+   * {@link #sortTargets(Collection, PsiElement)} with a context that holds no PSI, for a lazy target list.
+   */
+  public static @NotNull SortedTargets sortTargets(@NotNull Collection<GuiceEntry> entries,
+                                                   @NotNull SortContext context) {
     if (entries.isEmpty()) {
       return new SortedTargets(List.of(), List.of());
     }
 
-    PsiFile contextFile = contextElement.getContainingFile();
-    Project project = contextElement.getProject();
-    String[] contextPkg = getPackageSegments(contextFile);
+    VirtualFile contextFile = context.file();
+    Project project = context.project();
+    String[] contextPkg = context.packageSegments();
 
     List<SortableEntry> sortable = new ArrayList<>(entries.size());
     Set<PsiElement> seenTargets = new HashSet<>(entries.size());
@@ -132,7 +152,7 @@ public final class GuiceEntryTargetRenderer extends PsiTargetPresentationRendere
       PsiFile targetFile = target.getContainingFile();
       VirtualFile vFile = targetFile != null ? targetFile.getVirtualFile() : null;
       boolean isTest = vFile != null && TestSourcesFilter.isTestSources(vFile, project);
-      boolean isSameFile = contextFile != null && contextFile.equals(targetFile);
+      boolean isSameFile = contextFile != null && contextFile.equals(vFile);
 
       String[] targetPkg = getPackageSegments(targetFile);
       int common = commonPrefixLength(contextPkg, targetPkg);

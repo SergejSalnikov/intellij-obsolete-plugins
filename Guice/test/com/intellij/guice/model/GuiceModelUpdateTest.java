@@ -20,6 +20,7 @@ import com.intellij.psi.impl.source.PsiFileImpl;
 import com.intellij.serviceContainer.AlreadyDisposedException;
 import com.intellij.testFramework.PlatformTestUtil;
 import com.intellij.util.concurrency.AppExecutorUtil;
+import com.intellij.util.containers.ContainerUtil;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CancellationException;
@@ -146,18 +147,29 @@ public class GuiceModelUpdateTest extends GuiceTestBase {
     assertThat(index.getFilesWithEntriesOfTypes(List.of("MyKey"))).containsExactly(client.getVirtualFile());
   }
 
-  public void testFirstHighlightingPassAfterEditShowsNewGutter() {
+  /**
+   * The pass of an edited file shows the new gutter at once, and it only reads: the file stays dirty and the
+   * index keeps the entries from before the edit until the background update.
+   */
+  public void testFirstHighlightingPassAfterEditShowsNewGutterAndDoesNotWriteToTheIndex() {
     configureClientAndModule();
     GuiceProjectModel model = model();
     assertThat(gutterAnchors(TO_BINDINGS_TOOLTIP)).containsExactly("service");
+    GuiceNavigationIndex index = getNavigationIndex();
+    GuiceBindingKey key = ReadAction.compute(() -> GuiceBindingKey.forClass(myFixture.findClass("MyService")));
+    assertThat(index.findByKey(key, EntryRole.INJECTION_POINT)).hasSize(1);
 
-    // In background mode nothing processes the dirty file synchronously, except the line marker pass itself.
-    model.getBackgroundUpdater().enableBackgroundModeForTests(getTestRootDisposable());
+    // Background mode without the dirty collector: only a write from the pass could process the dirty file.
+    model.getBackgroundUpdater().enableBackgroundModeForTests(getTestRootDisposable(), false);
     replaceClientText(CLIENT_WITH_ONE_INJECT.replace("MyService service;", "MyService service;\n  @Inject MyService service2;"));
     assertThat(model.hasDirtyFiles()).isTrue();
 
     assertThat(gutterAnchors(TO_BINDINGS_TOOLTIP)).containsExactly("service", "service2");
-    assertThat(model.hasDirtyFiles()).isFalse();
+    assertThat(gutterTargets(TO_BINDINGS_TOOLTIP))
+      .containsExactly("bind(MyService.class).to(MyServiceImpl.class)", "bind(MyService.class).to(MyServiceImpl.class)");
+
+    assertThat(model.hasDirtyFiles()).isTrue();
+    assertThat(index.findByKey(key, EntryRole.INJECTION_POINT)).hasSize(1);
   }
 
   /**
@@ -248,10 +260,9 @@ public class GuiceModelUpdateTest extends GuiceTestBase {
 
     replaceClientText(module.getText().replace("protected void configure() {", "protected void configure() {\n    bind(Api.class).to(ApiImpl.class);"));
     assertThat(processClientNow(module.getVirtualFile())).isTrue();
-    model.requestRestartOfAffectedEditors(GuiceProjectModel.RestartMode.WHEN_DAEMON_FINISHES, module.getVirtualFile());
+    model.requestRestartOfAffectedEditors(GuiceProjectModel.RestartMode.WHEN_DAEMON_FINISHES);
 
     assertThat(model.hasDeferredRestart(api.getVirtualFile())).isTrue();
-    assertThat(model.hasDeferredRestart(module.getVirtualFile())).isFalse();
   }
 
   /**
@@ -270,32 +281,113 @@ public class GuiceModelUpdateTest extends GuiceTestBase {
   }
 
 
-  public void testEditInsideHighlightingDefersRestartOfOtherOpenFiles() {
-    PsiFile client = configureClientAndModule();
-    getNavigationIndex();
+  /**
+   * The background update stores the entries that the pass of the edited file extracted, so each edit is
+   * extracted once. It restarts the other open files that show the changed type, but not the edited file:
+   * the pass of that file has shown the result already.
+   */
+  public void testBackgroundUpdateReusesThePassExtractionAndDoesNotRestartTheEditedFile() {
+    PsiFile client = myFixture.addFileToProject(
+      "Client.java", CLIENT_WITH_ONE_INJECT.replace("MyService service;", "MyService service;\n  @Inject MyKey key;"));
+    PsiFile module = myFixture.configureByText("MyModule.java", """
+      import com.google.inject.AbstractModule;
+      public class MyModule extends AbstractModule {
+        @Override
+        protected void configure() {
+          bind(MyService.class).to(MyServiceImpl.class);
+        }
+      }
+      """);
+    GuiceNavigationIndex index = getNavigationIndex();
     GuiceProjectModel model = model();
-    VirtualFile moduleFile = myFixture.findFileInTempDir("MyModule.java");
+    GuiceBindingKey myKey = ReadAction.compute(() -> GuiceBindingKey.forClass(myFixture.findClass("MyKey")));
 
-    // Edit the module while it is highlighted: the client shows MyService counterparts, so it must be re-highlighted,
-    // but only after the running daemon cycle. (Unit-test mode records the deferred files and issues no restart.)
-    myFixture.openFileInEditor(moduleFile);
-    // Background mode without the dirty collector: the highlighting pass, not a debounced drain, must be the
-    // first to process the module, whatever the timing of the daemon.
+    // Background mode without the dirty collector: this test runs the drain itself.
     model.getBackgroundUpdater().enableBackgroundModeForTests(getTestRootDisposable(), false);
     model.clearPendingRestartsForTests();
-    WriteCommandAction.runWriteCommandAction(getProject(), () -> {
-      Document document = myFixture.getEditor().getDocument();
-      document.setText(document.getText().replace("bind(MyService.class).to(MyServiceImpl.class);", ""));
-      PsiDocumentManager.getInstance(getProject()).commitDocument(document);
-    });
+    replaceClientText(module.getText().replace("bind(MyService.class).to(MyServiceImpl.class);",
+                                               "bind(MyService.class).to(MyServiceImpl.class);\n    bind(MyKey.class).toInstance(null);"));
+    assertThat(model.hasDirtyFiles()).isTrue();
+
+    // The pass of the module shows the new binding and writes nothing.
+    assertThat(gutterTargets(TO_INJECTION_POINTS_TOOLTIP)).contains("@Inject MyKey key;");
     assertThat(model.hasDirtyFiles()).isTrue();
     assertThat(model.hasDeferredRestart(client.getVirtualFile())).isFalse();
+    assertThat(index.findByKey(myKey, EntryRole.BINDING_SITE)).isEmpty();
+    GuiceNavigationView view = ReadAction.compute(() -> model.getNavigationView(myFixture.getModule(), module));
+    GuiceEntry shown = ContainerUtil.getOnlyItem(view.findByKey(myKey, EntryRole.BINDING_SITE));
+    assertThat(shown).isNotNull();
 
-    myFixture.doHighlighting();
-
+    // The drain. Unit-test mode records the files to restart and issues no restart.
+    ReadAction.run(() -> model.getBackgroundUpdater().processDirtyFilesNow());
     assertThat(model.hasDirtyFiles()).isFalse();
+    assertThat(ContainerUtil.getOnlyItem(index.findByKey(myKey, EntryRole.BINDING_SITE))).isSameInstanceAs(shown);
     assertThat(model.hasDeferredRestart(client.getVirtualFile())).isTrue();
-    assertThat(model.hasDeferredRestart(moduleFile)).isFalse();
+    assertThat(model.hasDeferredRestart(module.getVirtualFile())).isFalse();
+  }
+
+  /**
+   * New entries of the edited file match each other in the pass: an injection point and its binding in one file.
+   */
+  public void testPassMatchesTheNewEntriesOfOneFile() {
+    PsiFile both = myFixture.configureByText("Both.java", """
+      import com.google.inject.AbstractModule;
+      import com.google.inject.Inject;
+      class Holder {
+        @Inject MyService service;
+      }
+      public class Both extends AbstractModule {
+        @Override
+        protected void configure() {
+        }
+      }
+      """);
+    GuiceProjectModel model = model();
+    assertThat(gutterAnchors(TO_BINDINGS_TOOLTIP)).isEmpty();
+
+    model.getBackgroundUpdater().enableBackgroundModeForTests(getTestRootDisposable(), false);
+    replaceClientText(both.getText().replace("protected void configure() {",
+                                             "protected void configure() {\n    bind(MyService.class).to(MyServiceImpl.class);"));
+
+    assertThat(gutterAnchors(TO_BINDINGS_TOOLTIP)).containsExactly("service");
+    assertThat(gutterTargets(TO_BINDINGS_TOOLTIP)).containsExactly("bind(MyService.class).to(MyServiceImpl.class)");
+    assertThat(gutterTargets(TO_INJECTION_POINTS_TOOLTIP)).contains("@Inject MyService service;");
+    assertThat(model.hasDirtyFiles()).isTrue();
+  }
+
+  /**
+   * In a query with an overlay, the entries of the overlay stand for the stored entries of its file,
+   * and they match the stored entries of the other files.
+   */
+  public void testOverlayReplacesTheStoredEntriesOfItsFileInQueries() {
+    PsiFile client = configureClientAndModule();
+    GuiceNavigationIndex index = getNavigationIndex();
+    String clientPath = client.getVirtualFile().getPath();
+    GuiceBindingKey key = ReadAction.compute(() -> GuiceBindingKey.forClass(myFixture.findClass("MyService")));
+    GuiceEntry binding = ContainerUtil.getOnlyItem(index.findByKey(key, EntryRole.BINDING_SITE));
+    assertThat(binding).isNotNull();
+    GuiceEntry stored = ContainerUtil.getOnlyItem(index.findCounterparts(binding));
+    assertThat(stored).isNotNull();
+
+    // An overlay without entries: the file has no injection point any more.
+    GuiceFileOverlay empty = new GuiceFileOverlay(clientPath, GuiceEntryProducer.FileExtractionResult.EMPTY);
+    assertThat(index.findCounterparts(binding, empty, GuiceEntry::isValid)).isEmpty();
+    assertThat(index.findByKey(key, EntryRole.INJECTION_POINT, empty, GuiceEntry::isValid)).isEmpty();
+    // The index itself did not change.
+    assertThat(index.findCounterparts(binding)).hasSize(1);
+
+    // An overlay with a fresh extraction: its entry stands for the stored one.
+    GuiceEntryProducer.FileExtractionResult extraction = ReadAction.compute(() -> GuiceEntryProducer.extractFileData(client));
+    GuiceFileOverlay overlay = new GuiceFileOverlay(clientPath, extraction);
+    GuiceEntry fresh = ContainerUtil.getOnlyItem(index.findCounterparts(binding, overlay, GuiceEntry::isValid));
+    assertThat(fresh).isNotNull();
+    assertThat(fresh).isNotSameInstanceAs(stored);
+    assertThat(ContainerUtil.containsIdentity(extraction.entries(), fresh)).isTrue();
+
+    // The entry of the overlay matches the stored entry of the module file, and the anchor lookup finds it.
+    assertThat(ContainerUtil.getOnlyItem(index.findCounterparts(fresh, overlay, GuiceEntry::isValid))).isSameInstanceAs(binding);
+    PsiClass clientClass = myFixture.findClass("Client");
+    assertThat(ContainerUtil.getOnlyItem(index.findEntriesByAnchor(clientClass.getFields()[0], overlay))).isSameInstanceAs(fresh);
   }
 
   public void testEditThatKeepsEntriesDoesNotChangeIndex() {
@@ -645,6 +737,41 @@ public class GuiceModelUpdateTest extends GuiceTestBase {
 
     // Reading the targets, as the popup does, may load them.
     assertThat(gutterTargets(TO_INJECTION_POINTS_TOOLTIP)).hasSize(2 * n);
+  }
+
+  /**
+   * The pass of a file with an injection point needs to know only that a binding exists. It restores one
+   * target at most, and the popup restores the others. A {@code bind()} call is not stub-based, so the
+   * restore of its pointer loads the AST of the module file.
+   */
+  public void testInjectionPointPassRestoresOneCounterpartAtMost() {
+    int n = 5;
+    List<PsiFile> modules = new ArrayList<>();
+    for (int i = 0; i < n; i++) {
+      modules.add(myFixture.addFileToProject("Module" + i + ".java", """
+        import com.google.inject.AbstractModule;
+        public class Module%d extends AbstractModule {
+          @Override protected void configure() {
+            bind(MyService.class).to(MyServiceImpl.class);
+          }
+        }
+        """.formatted(i)));
+    }
+    PsiFile client = myFixture.configureByText("Client.java", CLIENT_WITH_ONE_INJECT);
+    getNavigationIndex();
+    myFixture.doHighlighting();
+
+    WriteAction.run(() -> {
+      for (PsiFile module : modules) ((PsiFileImpl)module).onContentReload();
+    });
+    assertThat(countLoaded(modules)).isEqualTo(0);
+
+    DaemonCodeAnalyzer.getInstance(getProject()).restart(client, "test");
+    assertThat(gutterAnchors(TO_BINDINGS_TOOLTIP)).containsExactly("service");
+    assertThat(countLoaded(modules)).isAtMost(1);
+
+    // Reading the targets, as the popup does, restores all of them.
+    assertThat(gutterTargets(TO_BINDINGS_TOOLTIP)).hasSize(n);
   }
 
   private static int countLoaded(List<PsiFile> files) {

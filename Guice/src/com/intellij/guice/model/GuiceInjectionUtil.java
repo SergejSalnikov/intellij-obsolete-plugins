@@ -87,26 +87,26 @@ public final class GuiceInjectionUtil {
   }
 
   public static @Nullable PsiClass getCallExpressionType(@NotNull UCallExpression expression, final String name) {
-    PsiClass aClass = null;
+    return getCallExpressionPsiType(expression, name) instanceof PsiClassType classType ? classType.resolve() : null;
+  }
+
+  /**
+   * Like {@link #getCallExpressionType}, but returns the type with its type arguments, for example
+   * {@code Impl<String>} for {@code to(new TypeLiteral<Impl<String>>() {})}.
+   */
+  public static @Nullable PsiType getCallExpressionPsiType(@NotNull UCallExpression expression, final String name) {
     final UExpression uExpression = GuiceUtils.getArgumentOfCallInChain(expression, name);
     if (uExpression != null) {
-      final PsiType type = GuiceUtils.getBindingTypeFromExpression(uExpression);
-      if (type instanceof PsiClassType) {
-        aClass = ((PsiClassType)type).resolve();
-      }
-    } else {
-      final UCallExpression inCall = GuiceUtils.findCallInChain(expression, name);
-      if (inCall != null) {
-        final List<PsiType> typeArgs = inCall.getTypeArguments();
-        if (!typeArgs.isEmpty()) {
-          final PsiType type = typeArgs.getFirst();
-          if (type instanceof PsiClassType) {
-            aClass = ((PsiClassType)type).resolve();
-          }
-        }
+      return GuiceUtils.getBindingTypeFromExpression(uExpression);
+    }
+    final UCallExpression inCall = GuiceUtils.findCallInChain(expression, name);
+    if (inCall != null) {
+      final List<PsiType> typeArgs = inCall.getTypeArguments();
+      if (!typeArgs.isEmpty()) {
+        return typeArgs.getFirst();
       }
     }
-    return aClass;
+    return null;
   }
 
 }

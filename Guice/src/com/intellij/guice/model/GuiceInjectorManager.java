@@ -21,6 +21,7 @@ import com.intellij.psi.search.SearchScope;
 import com.intellij.psi.search.searches.ClassInheritorsSearch;
 import com.intellij.psi.util.InheritanceUtil;
 import com.intellij.psi.util.PsiTreeUtil;
+import com.intellij.util.Processor;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.uast.UClass;
@@ -214,11 +215,15 @@ public final class GuiceInjectorManager {
     }
   }
 
-  public static PsiClass @NotNull [] getGuiceModuleClasses(final @NotNull Module module, @NotNull GlobalSearchScope scope) {
+  /**
+   * Gives each Guice module class of the scope to the processor. The processor may run on several threads.
+   */
+  public static void processGuiceModuleClasses(final @NotNull Module module,
+                                               @NotNull GlobalSearchScope scope,
+                                               @NotNull Processor<? super PsiClass> processor) {
     final PsiClass moduleInterface = JavaPsiFacade.getInstance(module.getProject()).findClass("com.google.inject.Module", scope);
-    if (moduleInterface == null) {
-      return PsiClass.EMPTY_ARRAY;
+    if (moduleInterface != null) {
+      ClassInheritorsSearch.search(moduleInterface, scope, true).forEach(processor);
     }
-    return ClassInheritorsSearch.search(moduleInterface, scope, true).findAll().toArray(PsiClass.EMPTY_ARRAY);
   }
 }

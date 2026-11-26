@@ -7,10 +7,13 @@ import com.intellij.guice.model.GuiceInjectionUtil;
 import com.intellij.guice.model.GuiceQualifiers;
 import com.intellij.guice.utils.GuiceUtils;
 import com.intellij.psi.PsiClass;
+import com.intellij.psi.PsiClassType;
+import com.intellij.psi.PsiType;
 import com.intellij.psi.PsiElement;
 import com.intellij.psi.PsiCompiledElement;
 import com.intellij.psi.PsiJavaFile;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.jetbrains.uast.UCallExpression;
 import org.jetbrains.uast.UExpression;
 
@@ -44,14 +47,28 @@ public class MoveBindingToClassPredicate implements PsiElementPredicate {
 
   /**
    * Tells if {@code chain} is a standard {@code bind(X.class).<targetCall>(Y.class)} chain of an unqualified key
-   * whose target is a class, not a {@code Key.get(...)} link.
+   * whose target is a class, not a {@code Key.get(...)} link, and if an annotation can name both classes.
    */
   static boolean isPlainLinkedBinding(@NotNull UCallExpression chain, @NotNull String targetCall) {
     if (!GuiceUtils.isStandardBindChain(chain) || GuiceUtils.isQualifiedBindChain(chain)) return false;
     UCallExpression target = GuiceUtils.findCallInChain(chain, targetCall);
     if (target == null) return false;
     List<UExpression> args = target.getValueArguments();
-    return args.size() != 1 || GuiceQualifiers.asKeyGet(args.getFirst()) == null;
+    if (args.size() == 1 && GuiceQualifiers.asKeyGet(args.getFirst()) != null) return false;
+    return isPlainNamedClass(GuiceUtils.findImplementedTypeForBinding(chain))
+           && isPlainNamedClass(GuiceInjectionUtil.getCallExpressionPsiType(chain, targetCall));
+  }
+
+  /**
+   * Tells if {@code @ImplementedBy(X.class)} or {@code @ProvidedBy(X.class)} can name the type and keep the
+   * meaning of the binding. A local or anonymous class has no qualified name. A type with type arguments,
+   * from a {@code TypeLiteral}, would become its raw class, and the annotation would apply to every
+   * parameterization.
+   */
+  static boolean isPlainNamedClass(@Nullable PsiType type) {
+    if (!(type instanceof PsiClassType classType) || classType.getParameters().length != 0) return false;
+    PsiClass psiClass = classType.resolve();
+    return psiClass != null && psiClass.getQualifiedName() != null;
   }
 
   /**

@@ -256,7 +256,7 @@ class GuiceBackgroundIndexUpdater(
 
     private suspend fun processDirtyFilesInBackground() {
         if (!model.hasDirtyFiles()) {
-            model.requestRestartOfAffectedEditors(GuiceProjectModel.RestartMode.IMMEDIATELY, null)
+            model.requestRestartOfAffectedEditors(GuiceProjectModel.RestartMode.IMMEDIATELY)
             return
         }
 
@@ -285,7 +285,7 @@ class GuiceBackgroundIndexUpdater(
             }
         }
 
-        model.requestRestartOfAffectedEditors(GuiceProjectModel.RestartMode.IMMEDIATELY, null)
+        model.requestRestartOfAffectedEditors(GuiceProjectModel.RestartMode.IMMEDIATELY)
     }
 
     /**
@@ -302,7 +302,7 @@ class GuiceBackgroundIndexUpdater(
             }
         }
         // Runs inside a highlighting pass, see GuiceProjectModel.getNavigationIndex.
-        model.requestRestartOfAffectedEditors(GuiceProjectModel.RestartMode.WHEN_DAEMON_FINISHES, null)
+        model.requestRestartOfAffectedEditors(GuiceProjectModel.RestartMode.WHEN_DAEMON_FINISHES)
     }
 
     /**
@@ -334,7 +334,7 @@ class GuiceBackgroundIndexUpdater(
         }
         processDirtyFilesNow()
         runReadAction { model.completePopulationIfCurrent(generation, pathsBefore, discoveredFiles) }
-        model.requestRestartOfAffectedEditors(GuiceProjectModel.RestartMode.WHEN_DAEMON_FINISHES, null)
+        model.requestRestartOfAffectedEditors(GuiceProjectModel.RestartMode.WHEN_DAEMON_FINISHES)
     }
 
     private suspend fun runPopulationLoop(module: Module) {
@@ -404,7 +404,7 @@ class GuiceBackgroundIndexUpdater(
             }
         }
 
-        model.requestRestartOfAffectedEditors(GuiceProjectModel.RestartMode.IMMEDIATELY, null)
+        model.requestRestartOfAffectedEditors(GuiceProjectModel.RestartMode.IMMEDIATELY)
     }
 
     /**
