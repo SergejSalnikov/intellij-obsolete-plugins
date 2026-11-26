@@ -3,6 +3,8 @@ package com.intellij.guice.model;
 
 import com.intellij.codeInsight.daemon.RelatedItemLineMarkerInfo;
 import com.intellij.codeInsight.daemon.RelatedItemLineMarkerProvider;
+import com.intellij.guice.constants.GuiceAnnotations;
+import com.intellij.java.library.JavaLibraryUtil;
 import com.intellij.openapi.module.Module;
 import com.intellij.openapi.module.ModuleUtilCore;
 import com.intellij.openapi.project.IndexNotReadyException;
@@ -11,6 +13,7 @@ import com.intellij.psi.PsiElement;
 import com.intellij.psi.PsiFile;
 import com.intellij.psi.PsiNameIdentifierOwner;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import java.util.Collection;
 import java.util.List;
@@ -18,7 +21,8 @@ import java.util.function.Supplier;
 
 /**
  * Shared base of the Guice line marker providers. It tests that the module has Guice before it collects
- * markers, and it gives the providers a read-only view of the index for the highlighted file.
+ * markers, and it gives the providers a read-only view of the index for the highlighted file. The file can
+ * be a source file of a library.
  *
  * <p>A provider only reads. The index is written by {@link GuiceBackgroundIndexUpdater} alone: when the index
  * is behind on the highlighted file, the view takes the entries of the file from its PSI
@@ -56,11 +60,11 @@ abstract class GuiceLineMarkerProviderBase extends RelatedItemLineMarkerProvider
                                              boolean forNavigation) {
     if (elements.isEmpty()) return;
     PsiElement first = elements.getFirst();
-    Module module = ModuleUtilCore.findModuleForPsiElement(first);
-    // Test the module before the service exists: a project without Guice never creates the service.
-    if (module == null || !GuiceProjectModel.isGuiceAvailable(module)) return;
     PsiFile file = first.getContainingFile();
     if (file == null) return;
+    // Test the module before the service exists: a project without Guice never creates the service.
+    Module module = findGuiceModule(first, file);
+    if (module == null) return;
 
     PassContext context = new PassContext(module, file);
     // The loop of RelatedItemLineMarkerProvider, with the context of this call.
@@ -74,6 +78,24 @@ abstract class GuiceLineMarkerProviderBase extends RelatedItemLineMarkerProvider
         }
       }
     }
+  }
+
+  /**
+   * Returns the module to request the index for, or {@code null} when the Guice features do not apply to the file.
+   *
+   * <p>A file in the content of a module needs Guice in that module. A file of a library, classes or sources,
+   * is in the content of no module: it gets a module that uses the library, and it needs Guice in the project.
+   */
+  private static @Nullable Module findGuiceModule(@NotNull PsiElement element, @NotNull PsiFile file) {
+    // For an element inside a file, the lookup gives only the module that has the file in its content.
+    Module module = ModuleUtilCore.findModuleForPsiElement(element);
+    if (module != null) {
+      return GuiceProjectModel.isGuiceAvailable(module) ? module : null;
+    }
+    // For the file itself, the lookup also gives a module that uses the library of the file.
+    Module libraryUser = ModuleUtilCore.findModuleForPsiElement(file);
+    if (libraryUser == null) return null;
+    return JavaLibraryUtil.hasLibraryClass(file.getProject(), GuiceAnnotations.INJECT) ? libraryUser : null;
   }
 
   /**
